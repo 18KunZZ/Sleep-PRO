@@ -12,12 +12,12 @@ from termcolor import colored
 
 # _, term_width = os.popen('stty size', 'r').read().split()
 try:
-    # 尝试读取终端尺寸（仅在交互式终端中生效）
+    # Try to read the terminal size (works only in interactive terminals)
     _, term_width = os.popen('stty size', 'r').read().split()
-    term_width = int(term_width)  # 转换为整数（原始代码可能已有此步，保留）
+    term_width = int(term_width)  # Convert to an integer for compatibility
 except (ValueError, OSError):
-    # 当 stty 命令失败时（如后台运行、无终端），设置默认宽度
-    term_width = 80  # 默认值，可根据需求调整（如 120）
+    # Use a default width when stty fails, such as in background or headless runs
+    term_width = 80  # Adjust if a wider default, such as 120, is preferred
 
 
 
@@ -185,7 +185,7 @@ def summarize_result(config, fold, y_true, y_pred, save=True):
     os.makedirs('results', exist_ok=True)
     y_pred_argmax = np.argmax(y_pred, 1)
 
-    # 强制 5 分类，缺失类别自动补 0，确保混淆矩阵一定是 5×5
+    # Enforce five classes and fill missing classes with zeros for a 5x5 matrix
     result_dict = skmet.classification_report(
         y_true, y_pred_argmax,
         labels=[0, 1, 2, 3, 4],
@@ -195,14 +195,14 @@ def summarize_result(config, fold, y_true, y_pred, save=True):
     )
     cm = skmet.confusion_matrix(y_true, y_pred_argmax, labels=[0, 1, 2, 3, 4])
 
-    # 直接计算总体指标（避免 result_dict 缺失 'accuracy' 或 'macro avg'）
+    # Compute aggregate metrics directly in case result_dict lacks expected keys
     accuracy = round(skmet.accuracy_score(y_true, y_pred_argmax) * 100, 1)
     macro_f1 = round(
         skmet.f1_score(y_true, y_pred_argmax, average='macro', labels=[0, 1, 2, 3, 4], zero_division=0) * 100, 1
     )
     kappa = round(skmet.cohen_kappa_score(y_true, y_pred_argmax), 3)
 
-    # 安全提取各类别指标（键名是 '0','1','2','3','4'）
+    # Safely extract per-class metrics stored under keys '0' through '4'
     def safe_get(cls, metric):
         key = str(cls)
         if key in result_dict and isinstance(result_dict[key], dict):
