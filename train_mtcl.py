@@ -19,31 +19,31 @@ from models.main_model import MainModel
 
 def print_module_params(model, indent=0):
     """
-    按模块层级递归打印参数量
+    Recursively print parameter counts by module hierarchy.
 
     Args:
-        model: PyTorch模型
-        indent: 缩进级别（用于层级显示）
+        model: PyTorch model.
+        indent: Indentation level used to display the hierarchy.
     """
     indent_str = "  " * indent
     total_params = 0
 
-    # 遍历所有子模块
+    # Iterate over all child modules
     for name, child in model.named_children():
-        # 计算当前子模块的参数量
+        # Count parameters in the current child module
         child_params = sum(p.numel() for p in child.parameters() if p.requires_grad)
         total_params += child_params
 
-        # 如果子模块还有子模块，递归打印
+        # Recurse when the child module contains nested modules
         if len(list(child.children())) > 0:
             print(f"{indent_str}- {name}: {child_params:,} parameters")
             print_module_params(child, indent + 1)
         else:
-            # 叶子节点（基础模块）直接打印
+            # Print leaf modules directly
             print(f"{indent_str}  - {name}: {child_params:,} parameters")
 
-    # 打印当前层级的总参数量
-    if indent == 0:  # 顶层
+    # Print the total parameter count at the top level
+    if indent == 0:  # Top level
         print(f"{indent_str}Total: {total_params:,} parameters")
 
 
@@ -63,8 +63,8 @@ class OneFoldTrainer:
 
         self.train_iter = 0
 
-        # ========== 路径隔离：保存目录必须带模式后缀 ==========
-        # 读取用 config['name']（原始配置名），保存用隔离后的名字
+        # Isolate output paths by adding the training mode suffix
+        # Read using the original config name and save using the isolated name
         if self.tp_cfg['mode'] == 'scratch':
             save_dir_name = config['name']
         else:
@@ -102,7 +102,7 @@ class OneFoldTrainer:
         model = MainModel(self.cfg)
 
         # ==========================================
-        # FLOPs 计算（保持原有）
+        # Preserve the existing FLOPs calculation
         # ==========================================
         try:
             from torchinfo import summary
@@ -127,11 +127,11 @@ class OneFoldTrainer:
 
         model = torch.nn.DataParallel(model, device_ids=list(range(len(self.args.gpu.split(",")))))
 
-        # ========== 加载预训练权重（完全硬编码路径） ==========
+        # Load pretrained weights from a fully hard-coded path
         if self.tp_cfg['mode'] != 'scratch':
             print('[INFO] Model loaded for finetune')
 
-            # ✅ 预训练路径完全硬编码，与当前 config['name'] 无关
+            # The pretrained path is hard-coded and independent of config['name']
             load_name = "SleePyCo-Transformer_SL-01_numScales-1_MASS_pretrain"
             load_path = os.path.join('checkpoints', load_name, f'ckpt_fold-{self.fold:02d}.pth')
 
@@ -147,7 +147,7 @@ class OneFoldTrainer:
             print('[INFO] Number of params of backbone: ', backbone_params)
         # ========================================================
 
-        # 按模块打印参数量
+        # Print parameter counts by module
         print("[INFO] 模型按模块参数量统计：")
         print_module_params(model)
 
