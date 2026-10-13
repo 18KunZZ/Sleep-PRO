@@ -20,41 +20,41 @@ from loss import SupSwAVLoss
 
 
 class_margins = {
-    0: 0.2,  # 清醒期
-    1: 0.02, # N1期
-    2: 0.1,  # N2期
-    3: 0.2, # N3期（深度睡眠，类内差异小）
-    4: 0.1  # REM期
+    0: 0.2,  # Wake stage
+    1: 0.02, # N1 stage
+    2: 0.1,  # N2 stage
+    3: 0.2, # N3 stage (deep sleep with low intra-class variation)
+    4: 0.1  # REM stage
 }
 
 
 def print_module_params(model, indent=0):
     """
-    按模块层级递归打印参数量
+    Recursively print parameter counts by module hierarchy.
 
     Args:
-        model: PyTorch模型
-        indent: 缩进级别（用于层级显示）
+        model: PyTorch model.
+        indent: Indentation level used to display the hierarchy.
     """
     indent_str = "  " * indent
     total_params = 0
 
-    # 遍历所有子模块
+    # Iterate over all child modules
     for name, child in model.named_children():
-        # 计算当前子模块的参数量
+        # Count parameters in the current child module
         child_params = sum(p.numel() for p in child.parameters() if p.requires_grad)
         total_params += child_params
 
-        # 如果子模块还有子模块，递归打印
+        # Recurse when the child module contains nested modules
         if len(list(child.children())) > 0:
             print(f"{indent_str}- {name}: {child_params:,} parameters")
             print_module_params(child, indent + 1)
         else:
-            # 叶子节点（基础模块）直接打印
+            # Print leaf modules directly
             print(f"{indent_str}  - {name}: {child_params:,} parameters")
 
-    # 打印当前层级的总参数量
-    if indent == 0:  # 顶层
+    # Print the total parameter count at the top level
+    if indent == 0:  # Top level
         print(f"{indent_str}Total: {total_params:,} parameters")
 
 
@@ -88,25 +88,25 @@ class OneFoldTrainer:
 
     def build_model(self):
         model = MainModel(self.cfg)
-        model.to(self.device)  # 先移动到 GPU/CPU
+        model.to(self.device)  # Move the model to the selected device first
 
         # ==========================================
-        # 🧮 [新增] FLOPs 和 参数量计算代码
+        # FLOPs and parameter-count calculation
         # ==========================================
         try:
             print("\n" + "=" * 40)
             print("[INFO] Calculating FLOPs and Params...")
 
-            # 1. 构造一个假的输入 (Batch=1, Channel=1, Length=3000)
-            # 请根据你 config['dataset']['input_size'] 确认长度是 3000 还是其他
+            # 1. Create a dummy input (batch=1, channel=1, length=3000)
+            # Confirm the actual length from config['dataset']['input_size']
             input_len = self.cfg['dataset'].get('input_size', 3000)
             dummy_input = torch.randn(1, 1, input_len).to(self.device)
 
-            # 2. 使用 thop 计算
-            # inputs 参数必须是 tuple，所以要加括号和逗号 (dummy_input, )
+            # 2. Calculate metrics with thop
+            # inputs must be a tuple, so retain the comma in (dummy_input,)
             flops, params = profile(model, inputs=(dummy_input,), verbose=False)
 
-            # 3. 打印结果 (自动换算为 M / G)
+            # 3. Print results converted to millions and billions
             print(f"----------------------------------------")
             print(f"输入尺寸: (1, 1, {input_len})")
             print(f"参数量 (Params): {params / 1e6:.4f} M (百万)")
@@ -145,19 +145,19 @@ class OneFoldTrainer:
             loss = 0
             labels = labels.view(-1).to(self.device)
 
-            # 1. 预处理：将list中的每个numpy视图转为Tensor，并添加batch维度
-            # inputs_list：MultiCrop生成的list，每个元素是[C, L]（C=1通道，L=不同长度）
+            # 1. Preprocess each NumPy view in the list as a tensor
+            # MultiCrop produces [C, L] views, where C=1 and L may vary
             tensor_list = []
             for view in inputs:
-                # 1. 转移设备；
-                tensor = view.to(self.device)  # 无需.float()（view已是float类型）
+                # Move the view to the selected device
+                tensor = view.to(self.device)  # No .float() call is needed
                 tensor_list.append(tensor)
 
-            # 2. 分批前向：每个视图单独过模型，获取特征
+            # 2. Run each view through the model separately to extract features
             view_features = []
             for tensor in tensor_list:
-                # 模型输出：[1, C, T]（C=通道数，T=模型输出的时间维度）
-                feat = self.model(tensor)[0]  # 取pretrain模式的输出（如c5）
+                # Model output: [1, C, T], with channel and temporal dimensions
+                feat = self.model(tensor)[0]  # Use the pretraining output, such as c5
                 view_features.append(feat)
 
             outputs = torch.cat(view_features, dim=0)
@@ -167,17 +167,17 @@ class OneFoldTrainer:
             # outputs = self.models(inputs)[0]
             # print(outputs.shape)
 
-            # 5. 重塑为SupConLoss要求的格式：[batch_size, n_views, C]
+            # 5. Reshape to the [batch_size, n_views, C] format expected by SupConLoss
             B = labels.size(0)
-            V = 6  # 比如 5
+            V = 6  # Number of views
             split_sizes = [B] * V  # [B, B, B, B, B]
 
-            views = torch.split(outputs, split_sizes, dim=0)  # 返回一个 tuple，长度 V，每个 [B, D]
+            views = torch.split(outputs, split_sizes, dim=0)  # V tensors shaped [B, D]
 
-            # 拼成 [B, V, D]
+            # Concatenate into [B, V, D]
             features = torch.cat([v.unsqueeze(1) for v in views], dim=1)
 
-            # 6. 计算损失（此时格式完全正确）
+            # 6. Compute the loss using the required feature format
             loss += self.criterion(features, labels)
 
             self.optimizer.zero_grad()
@@ -216,7 +216,7 @@ class OneFoldTrainer:
 
             # features = outputs.unsqueeze(1).repeat(1, 2, 1)
             features = outputs.unsqueeze(1)  # [B, 1, D]
-            # ProtoConLoss 要求至少 2 views，为简便建议只跳过验证阶段损失，或传 f1 + f1 模拟
+            # ProtoConLoss needs at least two views; duplicate features for validation
             features = torch.cat([features, features, features, features, features, features], dim=1)  # [B, 6, D]
 
             loss += self.criterion(features, labels)
@@ -263,4 +263,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
