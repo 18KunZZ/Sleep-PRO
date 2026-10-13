@@ -1,315 +1,313 @@
-import os
-import json
-import argparse
-import warnings
-
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-
-import matplotlib.pyplot as plt
-# import umap
-from sklearn.preprocessing import LabelEncoder
-
-from utils import *
-from loader import EEGDataLoader
-from models.main_model import MainModel
+import random
+import numpy as np
+from scipy import signal
+from scipy import interpolate
+from scipy.ndimage.interpolation import shift
 
 
-def print_module_params(model, indent=0):
-    """
-    Recursively print parameter counts by module hierarchy.
+class TwoTransform:
+    
+    def __init__(self, transform):
+        self.transform = transform
 
-    Args:
-        model: PyTorch model.
-        indent: Indentation level used to display the hierarchy.
-    """
-    indent_str = "  " * indent
-    total_params = 0
+    def __call__(self, x):
+        return [self.transform(x), self.transform(x)]
 
-    # Iterate over all child modules
-    for name, child in model.named_children():
-        # Count parameters in the current child module
-        child_params = sum(p.numel() for p in child.parameters() if p.requires_grad)
-        total_params += child_params
 
-        # Recurse when the child module contains nested modules
-        if len(list(child.children())) > 0:
-            print(f"{indent_str}- {name}: {child_params:,} parameters")
-            print_module_params(child, indent + 1)
+
+
+class MultiCropTransform:
+    def __init__(self, long_transform, short_transform, num_short=4,
+                 long_crop_ratio=0.8, middle_crop_ratio=0.5, short_crop_ratio=0.25, sr=100):
+        """
+        Multi-crop transform that preserves each crop's original length.
+
+        Args:
+            long_transform: Augmentation applied to long crops.
+            short_transform: Augmentation applied to short crops.
+            num_short: Number of short crops.
+            long_crop_ratio: Long-crop ratio relative to the original length.
+            short_crop_ratio: Short-crop ratio relative to the original length.
+            sr: Sampling rate used to calculate the actual duration.
+        """
+        self.long_transform = long_transform
+        self.short_transform = short_transform
+        self.num_short = num_short
+        self.long_crop_ratio = long_crop_ratio
+        self.middle_crop_ratio = middle_crop_ratio
+        self.short_crop_ratio = short_crop_ratio
+        self.sr = sr
+
+        # Ensure crop ratios are within valid ranges
+        assert 0 < self.long_crop_ratio <= 1, "长裁剪比例必须在(0, 1]之间"
+        assert 0 < self.short_crop_ratio <= self.long_crop_ratio, "短裁剪比例必须小于长裁剪比例且大于0"
+
+    def __call__(self, x):
+        """
+        Crop and augment an EEG segment while preserving crop lengths.
+
+        Args:
+            x: EEG segment shaped [channels, samples] or [samples].
+
+        Returns:
+            Augmented crops with different long- and short-crop lengths.
+        """
+        # Ensure the input is a NumPy array
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+
+        # Get the input length in samples
+        if x.ndim == 1:
+            length = x.shape[0]  # Single-channel input
         else:
-            # Print leaf modules directly
-            print(f"{indent_str}  - {name}: {child_params:,} parameters")
+            length = x.shape[1]  # Multi-channel input: [channels, samples]
 
-    # Print the total parameter count at the top level
-    if indent == 0:  # Top level
-        print(f"{indent_str}Total: {total_params:,} parameters")
+        crops = []
 
-
-class OneFoldTrainer:
-    def __init__(self, args, fold, config):
-        self.args = args
-        self.fold = fold
-
-        self.cfg = config
-        self.ds_cfg = config['dataset']
-        self.fp_cfg = config['feature_pyramid']
-        self.tp_cfg = config['training_params']
-        self.es_cfg = self.tp_cfg['early_stopping']
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print('[INFO] Config name: {}'.format(config['name']))
-
-        self.train_iter = 0
-
-        # Isolate output paths by adding the training mode suffix
-        # Read using the original config name and save using the isolated name
-        if self.tp_cfg['mode'] == 'scratch':
-            save_dir_name = config['name']
+        # 1. Long crop without interpolation
+        # Calculate the long-crop length in samples
+        long_crop_length = int(length * self.long_crop_ratio)
+        long_crop_length = max(1, long_crop_length)
+        # Select a random start position
+        long_start = random.randint(0, length - long_crop_length)
+        # Extract the crop without normalizing its length
+        if x.ndim == 1:
+            long_crop = x[long_start:long_start + long_crop_length]
         else:
-            save_dir_name = f"{config['name']}_{self.tp_cfg['mode']}"
+            long_crop = x[:, long_start:long_start + long_crop_length]
+        # Apply augmentation and append the crop
+        crops.append(self.long_transform(long_crop))
 
-        self.ckpt_path = os.path.join('checkpoints', save_dir_name)
-        self.ckpt_name = 'ckpt_fold-{0:02d}.pth'.format(self.fold)
-        # ========================================================
+        # 2. Short crops without interpolation
+        # Calculate the short-crop length in samples
+        short_crop_length = int(length * self.short_crop_ratio)
+        short_crop_length = max(1, short_crop_length)
+        # Ensure the short crop does not exceed the input length
+        short_crop_length = min(short_crop_length, length)
 
-        self.early_stopping = EarlyStopping(
-            patience=self.es_cfg['patience'],
-            verbose=True,
-            ckpt_path=self.ckpt_path,
-            ckpt_name=self.ckpt_name,
-            mode=self.es_cfg['mode']
-        )
+        for _ in range(self.num_short):
+            # Select a random valid start position
+            short_start = random.randint(0, length - short_crop_length)
+            # Extract the crop without normalizing its length
+            if x.ndim == 1:
+                short_crop = x[short_start:short_start + short_crop_length]
+            else:
+                short_crop = x[:, short_start:short_start + short_crop_length]
+            # Apply augmentation and append the crop
+            crops.append(self.short_transform(short_crop))
 
-        self.model = self.build_model()
-        self.loader_dict = self.build_dataloader()
+        # Long and short outputs retain lengths determined by their ratios
+        return crops
 
-        self.criterion = nn.CrossEntropyLoss()
-        self.activate_train_mode()
-        self.optimizer = optim.Adam(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=self.tp_cfg['lr'],
-            weight_decay=self.tp_cfg['weight_decay']
-        )
 
-        self.ckpt_path = os.path.join('checkpoints', config['name'])
-        self.ckpt_name = 'ckpt_fold-{0:02d}.pth'.format(self.fold)
-        self.early_stopping = EarlyStopping(patience=self.es_cfg['patience'], verbose=True, ckpt_path=self.ckpt_path,
-                                            ckpt_name=self.ckpt_name, mode=self.es_cfg['mode'])
 
-    def build_model(self):
-        model = MainModel(self.cfg)
+class Compose:
 
-        # ==========================================
-        # Preserve the existing FLOPs calculation
-        # ==========================================
-        try:
-            from torchinfo import summary
-            real_input_len = 15000
-            print("\n" + "=" * 50)
-            print("[INFO] Calculating FLOPs with torchinfo...")
-            model_stats = summary(model,
-                                  input_size=(1, 1, real_input_len),
-                                  col_names=["input_size", "output_size", "num_params", "mult_adds"],
-                                  verbose=0)
-            total_mult_adds = model_stats.total_mult_adds
-            total_params = model_stats.total_params
-            print(f"[Statistics] Input Shape: (1, 1, {real_input_len})")
-            print(f"[Statistics] Params: {total_params / 1e6:.4f} M")
-            print(f"[Statistics] FLOPs (Mult-Adds): {total_mult_adds / 1e9:.4f} G")
-            print("=" * 50 + "\n")
-        except ImportError:
-            print("[WARN] 请安装 torchinfo: pip install torchinfo")
-        except Exception as e:
-            print(f"[WARN] torchinfo 计算失败: {e}")
-        # ==========================================
+    def __init__(self, transforms, mode='full'):
+        self.transforms = transforms
+        self.mode = mode
 
-        model = torch.nn.DataParallel(model, device_ids=list(range(len(self.args.gpu.split(",")))))
-
-        # Load pretrained weights from a fully hard-coded path
-        if self.tp_cfg['mode'] != 'scratch':
-            print('[INFO] Model loaded for finetune')
-
-            # The pretrained path is hard-coded and independent of config['name']
-            load_name = "SleePyCo-Transformer_SL-01_numScales-1_MASS_pretrain"
-            load_path = os.path.join('checkpoints', load_name, f'ckpt_fold-{self.fold:02d}.pth')
-
-            print(f'[INFO] Loading pretrain weights from : {load_path}')
-            print(f'[INFO] Saving finetune checkpoints to: {self.ckpt_path}')
-
-            if not os.path.exists(load_path):
-                raise FileNotFoundError(f"[ERROR] Pretrain checkpoint not found: {load_path}")
-
-            model.load_state_dict(torch.load(load_path), strict=False)
-
-            backbone_params = sum(p.numel() for p in model.module.feature.parameters() if p.requires_grad)
-            print('[INFO] Number of params of backbone: ', backbone_params)
-        # ========================================================
-
-        # Print parameter counts by module
-        print("[INFO] 模型按模块参数量统计：")
-        print_module_params(model)
-
-        model.to(self.device)
-        print('[INFO] Model prepared, Device used: {} GPU:{}'.format(self.device, self.args.gpu))
-
-        return model
-
-    def build_dataloader(self):
-        train_dataset = EEGDataLoader(self.cfg, self.fold, set='train')
-        train_loader = DataLoader(dataset=train_dataset, batch_size=self.tp_cfg['batch_size'], shuffle=True,
-                                  num_workers=4 * len(self.args.gpu.split(",")), pin_memory=True)
-        val_dataset = EEGDataLoader(self.cfg, self.fold, set='val')
-        val_loader = DataLoader(dataset=val_dataset, batch_size=self.tp_cfg['batch_size'], shuffle=False,
-                                num_workers=4 * len(self.args.gpu.split(",")), pin_memory=True)
-        test_dataset = EEGDataLoader(self.cfg, self.fold, set='test')
-        test_loader = DataLoader(dataset=test_dataset, batch_size=self.tp_cfg['batch_size'], shuffle=False,
-                                 num_workers=4 * len(self.args.gpu.split(",")), pin_memory=True)
-        print('[INFO] Dataloader prepared')
-
-        return {'train': train_loader, 'val': val_loader, 'test': test_loader}
-
-    def activate_train_mode(self):
-        self.model.train()
-        if self.tp_cfg['mode'] == 'freezefinetune':
-            print('[INFO] Freeze backone')
-            self.model.module.feature.train(False)
-            for p in self.model.module.feature.parameters():
-                p.requires_grad = False
-
-            print('[INFO] Unfreeze conv_c5')
-            self.model.module.feature.conv_c5.train(True)
-            for p in self.model.module.feature.conv_c5.parameters(): p.requires_grad = True
-
-            if self.fp_cfg['num_scales'] > 1:
-                print('[INFO] Unfreeze conv_c4')
-                self.model.module.feature.conv_c4.train(True)
-                for p in self.model.module.feature.conv_c4.parameters(): p.requires_grad = True
-
-            if self.fp_cfg['num_scales'] > 2:
-                print('[INFO] Unfreeze conv_c3')
-                self.model.module.feature.conv_c3.train(True)
-                for p in self.model.module.feature.conv_c3.parameters(): p.requires_grad = True
-
-    def train_one_epoch(self, epoch):
-        correct, total, train_loss = 0, 0, 0
-
-        for i, (inputs, labels) in enumerate(self.loader_dict['train']):
-            loss = 0
-            total += labels.size(0)
-            inputs = inputs.to(self.device)
-            labels = labels.view(-1).to(self.device)
-
-            outputs = self.model(inputs)
-            outputs_sum = torch.zeros_like(outputs[0])
-
-            for j in range(len(outputs)):
-                loss += self.criterion(outputs[j], labels)
-                outputs_sum += outputs[j]
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            train_loss += loss.item()
-            predicted = torch.argmax(outputs_sum, 1)
-            correct += predicted.eq(labels).sum().item()
-            self.train_iter += 1
-
-            progress_bar(i, len(self.loader_dict['train']), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (train_loss / (i + 1), 100. * correct / total, correct, total))
-
-            if self.train_iter % self.tp_cfg['val_period'] == 0:
-                print('')
-                val_acc, val_loss = self.evaluate(mode='val')
-                self.early_stopping(val_acc, val_loss, self.model)
-                self.activate_train_mode()
-                if self.early_stopping.early_stop:
-                    break
-
-    @torch.no_grad()
-    def evaluate(self, mode):
-        self.model.eval()
-        correct, total, eval_loss = 0, 0, 0
-        y_true = np.zeros(0)
-        y_pred = np.zeros((0, self.cfg['classifier']['num_classes']))
-
-        for i, (inputs, labels) in enumerate(self.loader_dict[mode]):
-            loss = 0
-            total += labels.size(0)
-            inputs = inputs.to(self.device)
-            labels = labels.view(-1).to(self.device)
-
-            outputs = self.model(inputs)
-            outputs_sum = torch.zeros_like(outputs[0])
-
-            for j in range(len(outputs)):
-                loss += self.criterion(outputs[j], labels)
-                outputs_sum += outputs[j]
-
-            eval_loss += loss.item()
-            predicted = torch.argmax(outputs_sum, 1)
-            correct += predicted.eq(labels).sum().item()
-
-            y_true = np.concatenate([y_true, labels.cpu().numpy()])
-            y_pred = np.concatenate([y_pred, outputs_sum.cpu().numpy()])
-
-            progress_bar(i, len(self.loader_dict[mode]), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (eval_loss / (i + 1), 100. * correct / total, correct, total))
-
-        if mode == 'val':
-            return 100. * correct / total, eval_loss
-        elif mode == 'test':
-            return y_true, y_pred
+    def __call__(self, x):
+        if self.mode == 'random':
+            index = random.randint(0, len(self.transforms) - 1)
+            x = self.transforms[index](x)
+        elif self.mode == 'full':
+            for t in self.transforms:
+                x = t(x)
+        elif self.mode == 'shuffle':
+            transforms = np.random.choice(self.transforms, len(self.transforms), replace=False)
+            for t in transforms:
+                x = t(x)
         else:
             raise NotImplementedError
+        return x
 
-    def run(self):
-        for epoch in range(self.tp_cfg['max_epochs']):
-            print('\n[INFO] Fold: {}, Epoch: {}'.format(self.fold, epoch))
-            self.train_one_epoch(epoch)
-            if self.early_stopping.early_stop:
-                break
-
-        self.model.load_state_dict(torch.load(os.path.join(self.ckpt_path, self.ckpt_name)))
-        y_true, y_pred = self.evaluate(mode='test')
-        print('')
-
-        return y_true, y_pred
+    def __repr__(self):
+        format_string = self.__class__.__name__ + '('
+        for t in self.transforms:
+            format_string += '\n'
+            format_string += '    {0}'.format(t)
+        format_string += '\n)'
+        return format_string
 
 
-def main():
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
+class RandomAmplitudeScale:
 
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--gpu', type=str, default="0", help='gpu id')
-    parser.add_argument('--config', type=str, help='config file path')
-    args = parser.parse_args()
+    def __init__(self, range=(0.5, 2.0), p=0.5):
+        self.range = range
+        self.p = p
 
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    def __call__(self, x):
+        if torch.rand(1) < self.p:
+            scale = random.uniform(self.range[0], self.range[1])
+            return x * scale
+        return x
 
-    # For reproducibility
-    set_random_seed(args.seed, use_cuda=True)
-
-    with open(args.config) as config_file:
-        config = json.load(config_file)
-    config['name'] = os.path.basename(args.config).replace('.json', '')
-
-    Y_true = np.zeros(0)
-    Y_pred = np.zeros((0, config['classifier']['num_classes']))
-
-    for fold in range(1, config['dataset']['num_splits'] + 1):
-        trainer = OneFoldTrainer(args, fold, config)
-        y_true, y_pred = trainer.run()
-        Y_true = np.concatenate([Y_true, y_true])
-        Y_pred = np.concatenate([Y_pred, y_pred])
-
-        summarize_result(config, fold, Y_true, Y_pred)
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
 
 
-if __name__ == "__main__":
-    main()
+class RandomDCShift:
+    
+    def __init__(self, range=(-10.0, 10.0), p=0.5):
+        self.range = range
+        self.p = p
+
+    def __call__(self, x):
+        if torch.rand(1) < self.p:
+            shift = random.uniform(self.range[0], self.range[1])
+            return x + shift
+        return x
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
+class RandomTimeShift:
+
+    def __init__(self, range=(-300, 300), mode='constant', cval=0.0, p=0.5):
+        self.range = range
+        self.mode = mode
+        self.cval = cval
+        self.p = p
+
+    def __call__(self, x):
+        if torch.rand(1) < self.p:
+            t_shift = random.randint(self.range[0], self.range[1])
+            if len(x.shape) == 2:
+                x = x[0]
+            x = shift(input=x, shift=t_shift, mode=self.mode, cval=self.cval)
+            x = np.expand_dims(x, axis=0)
+        return x
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
+# class RandomZeroMasking:
+#
+#     def __init__(self, range=(0, 300), p=0.5):
+#         self.range = range
+#         self.p = p
+#
+#     def __call__(self, x):
+#         if torch.rand(1) < self.p:
+#             mask_len = random.randint(self.range[0], self.range[1])
+#             random_pos = random.randint(0, x.shape[1] - mask_len)
+#             # print("DEBUG: x.shape=", x.shape, "mask_len=", mask_len)
+#
+#             mask = np.concatenate([np.ones((1, random_pos)), np.zeros((1, mask_len)), np.ones((1, x.shape[1] - mask_len - random_pos))], axis=1)
+#             return x * mask
+#         return x
+#
+#     def __repr__(self):
+#         return self.__class__.__name__ + '()'
+
+
+class RandomZeroMasking:
+
+    def __init__(self, mask_range=(0, 300), p=0.5):
+        self.mask_range = mask_range
+        self.p = p
+
+    def __call__(self, x):
+        # 1. Normalize the input shape
+        # Handle NumPy arrays and tensors consistently
+        # Convert shapes such as (1, 1, 1500, 1) to (C, Time)
+
+        input_is_tensor = isinstance(x, torch.Tensor)
+        if not input_is_tensor:
+            x = torch.from_numpy(x)  # Temporarily convert to a tensor for reshaping
+
+        # Extra dimensions indicate redundant singleton axes
+        if x.ndim > 2:
+            # squeeze() removes singleton axes: (1, 1, 1500, 1) -> (1500,)
+            x = x.squeeze()
+            # Restore a channel axis if squeezing produces a 1D signal
+            if x.ndim == 1:
+                x = x.unsqueeze(0)
+
+        # Convert back to NumPy to preserve the original downstream behavior
+        if not input_is_tensor and isinstance(x, torch.Tensor):
+            x = x.numpy()
+
+        # -----------------------------------------------------------
+        # Apply masking after x has been normalized to roughly [1, 1500]
+        # -----------------------------------------------------------
+        seq_len = x.shape[1]
+
+        # Identify unusual lengths, such as fragments produced by MultiCrop
+        # Standard lengths of 3000 and 1500 need no debug output
+        if seq_len != 3000 and seq_len != 1500:
+            # Add optional debug output here if needed
+            pass
+
+        if torch.rand(1) < self.p:
+            # Guard against signals shorter than the minimum mask length
+            if seq_len <= self.mask_range[0]:
+                return x
+
+            # Adjust the upper bound to the sequence length
+            max_mask_len = min(self.mask_range[1], seq_len)
+
+            # Select a random mask length
+            mask_len = random.randint(self.mask_range[0], max_mask_len)
+
+            # Select a random mask position
+            random_pos = random.randint(0, seq_len - mask_len)
+
+            # Build the mask
+            mask = np.concatenate([
+                np.ones((1, random_pos)),
+                np.zeros((1, mask_len)),
+                np.ones((1, seq_len - mask_len - random_pos))
+            ], axis=1)
+
+            # Match the mask type and device when x is a tensor
+            if isinstance(x, torch.Tensor):
+                mask = torch.from_numpy(mask).to(x.device).type_as(x)
+
+            return x * mask
+
+        return x
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
+class RandomAdditiveGaussianNoise:
+    
+    def __init__(self, range=(0.0, 0.2), p=0.5):
+        self.range = range
+        self.p = p
+
+    def __call__(self, x):
+        if torch.rand(1) < self.p:
+            sigma = random.uniform(self.range[0], self.range[1])
+            return x + np.random.normal(0, sigma, x.shape)
+        return x
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
+class RandomBandStopFilter:
+
+    def __init__(self, range=(0.5, 30.0), band_width=2.0, sampling_rate=100.0, p=0.5):
+        self.range = range
+        self.band_width = band_width
+        self.sampling_rate = sampling_rate
+        self.p = p
+
+    def __call__(self, x):
+        if torch.rand(1) < self.p:
+            low_freq = random.uniform(self.range[0], self.range[1])
+            center_freq = low_freq + self.band_width / 2.0
+            b, a = signal.iirnotch(center_freq, center_freq / self.band_width, fs=self.sampling_rate)
+            x = signal.lfilter(b, a, x)
+
+        return x
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
